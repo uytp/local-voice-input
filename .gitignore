@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 日志
+*.log
+
+# 语音模型（体积很大，不提交到仓库，请本地下载）
+models/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 系统文件
+Thumbs.db
+.DS_Store
