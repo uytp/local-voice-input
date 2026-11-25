@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 本地语音输入工具（SenseVoiceSmall · sherpa-onnx，完全离线）
-用法：按住小窗口里的“按住说话”按钮说话 → 松手 → 本地转文字 → 自动粘贴回
-      你之前正在用的窗口（微信 / 其他 AI 等），像微信“按住说话”一样。
+用法一：按住“按住说话”按钮说话，松手出字（适合短话）。
+用法二：点一下“按一下说话”按钮开始，说完再点一下停止并发送（适合长话）。
+      识别结果会自动粘贴回你之前正在用的窗口（微信 / 其他 AI 等）。
 
 模型文件位置（自动检测，无需联网）：
   ~/.dsh/speech-to-text/sensevoice/models/
@@ -11,6 +12,7 @@
 """
 
 import os
+import sys
 import time
 import queue
 import threading
@@ -32,7 +34,11 @@ NUM_THREADS = 2
 PLAY_BEEP = True         # 开始/结束提示音
 
 # 模型路径：优先用本目录下的 models/，其次用 ~/.dsh 下已下载的（DeepSeek 语音功能）
-_HERE = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # 打包成 exe 后，以 exe 所在目录为基准
+    _HERE = os.path.dirname(sys.executable)
+else:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
 _LOCAL_MODELS = os.path.join(_HERE, "models")
 _DSH_MODELS = os.path.join(os.path.expanduser("~"), ".dsh", "speech-to-text", "sensevoice", "models")
 
@@ -53,7 +59,17 @@ TOKENS = _pick([
     os.path.join(_DSH_MODELS, "sensevoice-onnx", "tokens.txt"),
 ])
 
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_input.log")
+def _log_dir():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, "VoiceInput")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+LOG_PATH = os.path.join(_log_dir(), "voice_input.log")
 # ========================================
 
 # 把输出写到日志，避免无窗口运行时丢失信息
@@ -120,7 +136,7 @@ def refocus_last_window():
 
 # ================= 状态 =================
 lock = threading.Lock()
-state = {"listening": False, "buffer": [], "start": 0.0}
+state = {"listening": False, "mode": None, "buffer": [], "start": 0.0}
 
 recognizer = None
 kb = Controller()
@@ -151,7 +167,7 @@ def paste(text):
 
 def finalize_text(samples):
     if samples is None or len(samples) < int(SAMPLE_RATE * 0.12):
-        ui("status", "待命 · 按住按钮说话（没听清）")
+        ui("status", "待命（没听清，请重试）")
         ui("btn", False)
         return
     ui("status", "识别中…")
@@ -163,7 +179,7 @@ def finalize_text(samples):
         ui("btn", False)
         return
     ui("last", text if text else "（未识别出文字）")
-    ui("status", "待命 · 按住按钮说话")
+    ui("status", "待命")
     ui("btn", False)
     if text:
         try:
@@ -174,12 +190,16 @@ def finalize_text(samples):
         log("识别结果: %s" % text)
 
 
-def start_session():
+def start_session(mode="hold"):
     with lock:
         state["listening"] = True
+        state["mode"] = mode
         state["buffer"] = []
         state["start"] = time.time()
-    ui("status", "录音中…（松开按钮结束）")
+    if mode == "toggle":
+        ui("status", "录音中…（再点一下停止并发送）")
+    else:
+        ui("status", "录音中…（松开按钮结束）")
     beep(880, 100)
 
 
@@ -188,6 +208,7 @@ def stop_session():
         if not state["listening"]:
             return
         state["listening"] = False
+        state["mode"] = None
         buf = state["buffer"]
         state["buffer"] = []
     samples = np.concatenate(buf) if buf else None
@@ -201,6 +222,7 @@ def audio_callback(indata, frames, time_info, status):
         state["buffer"].append(indata.reshape(-1).astype(np.float32) / 32768.0)
         if time.time() - state["start"] > MAX_SECONDS:
             state["listening"] = False
+            state["mode"] = None
             buf = state["buffer"]
             state["buffer"] = []
             overflow = True
@@ -226,7 +248,7 @@ def build_ui():
 
     root = tk.Tk()
     root.title("语音输入 · 本地 SenseVoice")
-    root.geometry("420x215+60+60")
+    root.geometry("430x270+60+60")
     root.attributes("-topmost", True)
     try:
         root.attributes("-toolwindow", True)
@@ -236,43 +258,80 @@ def build_ui():
     status_var = tk.StringVar(value="启动中…")
     last_var = tk.StringVar(value="（还没有内容）")
 
-    btn = tk.Button(root, text="按住说话", font=("Microsoft YaHei", 16, "bold"),
-                    height=2, bg="#4CAF50", fg="white", activebackground="#388E3C",
-                    activeforeground="white", relief="flat", cursor="hand2", takefocus=0)
-    btn.pack(fill="x", padx=12, pady=(10, 6))
+    # 按钮一：按住说话（长按，松手出字）
+    hold_btn = tk.Button(root, text="按住说话", font=("Microsoft YaHei", 15, "bold"),
+                         height=2, bg="#4CAF50", fg="white", activebackground="#388E3C",
+                         activeforeground="white", relief="flat", cursor="hand2", takefocus=0)
+    hold_btn.pack(fill="x", padx=12, pady=(10, 4))
+
+    # 按钮二：按一下说话 / 再按一下停止（点按，适合说长话）
+    toggle_btn = tk.Button(root, text="按一下说话（说长话用）", font=("Microsoft YaHei", 15, "bold"),
+                           height=2, bg="#1976D2", fg="white", activebackground="#1565C0",
+                           activeforeground="white", relief="flat", cursor="hand2", takefocus=0)
+    toggle_btn.pack(fill="x", padx=12, pady=(0, 6))
 
     tk.Label(root, textvariable=status_var, font=("Microsoft YaHei", 12, "bold"), fg="#0a7d33").pack(
         anchor="w", padx=12, pady=(2, 0))
     tk.Label(root, text="最近识别：", font=("Microsoft YaHei", 9), fg="#888").pack(
-        anchor="w", padx=12, pady=(8, 0))
+        anchor="w", padx=12, pady=(6, 0))
     tk.Label(root, textvariable=last_var, font=("Microsoft YaHei", 10),
-             wraplength=390, justify="left", anchor="nw").pack(
+             wraplength=400, justify="left", anchor="nw").pack(
         anchor="w", padx=12, fill="both", expand=True)
 
-    def set_button(recording):
-        if recording:
-            btn.config(text="松开结束", bg="#e53935", activebackground="#c62828")
+    def refresh_buttons():
+        with lock:
+            listening = state["listening"]
+            mode = state["mode"]
+        if listening and mode == "hold":
+            hold_btn.config(text="松开结束", bg="#e53935", activebackground="#c62828", state="normal")
+            toggle_btn.config(state="disabled")
+        elif listening and mode == "toggle":
+            toggle_btn.config(text="停止并发送", bg="#e53935", activebackground="#c62828", state="normal")
+            hold_btn.config(state="disabled")
         else:
-            btn.config(text="按住说话", bg="#4CAF50", activebackground="#388E3C")
+            hold_btn.config(text="按住说话", bg="#4CAF50", activebackground="#388E3C", state="normal")
+            toggle_btn.config(text="按一下说话（说长话用）", bg="#1976D2", activebackground="#1565C0", state="normal")
             try:
-                btn.grab_release()
+                hold_btn.grab_release()
             except Exception:
                 pass
 
-    def on_press(e):
+    def on_hold_press(e):
+        with lock:
+            if state["listening"]:
+                return  # 已在录音（点按模式），忽略
         try:
-            btn.grab_set_global()
+            hold_btn.grab_set_global()
         except Exception:
             pass
-        set_button(True)
-        start_session()
+        start_session("hold")
+        refresh_buttons()
 
-    def on_release(e):
-        set_button(False)
+    def on_hold_release(e):
+        with lock:
+            if not state["listening"] or state["mode"] != "hold":
+                return
         stop_session()
+        refresh_buttons()
 
-    btn.bind("<ButtonPress-1>", on_press)
-    btn.bind("<ButtonRelease-1>", on_release)
+    def on_toggle_click():
+        with lock:
+            if state["listening"]:
+                do_start = False
+                do_stop = (state["mode"] == "toggle")
+            else:
+                do_start = True
+                do_stop = False
+        if do_start:
+            start_session("toggle")
+            refresh_buttons()
+        elif do_stop:
+            stop_session()
+            refresh_buttons()
+
+    hold_btn.bind("<ButtonPress-1>", on_hold_press)
+    hold_btn.bind("<ButtonRelease-1>", on_hold_release)
+    toggle_btn.config(command=on_toggle_click)
 
     def poll_ui():
         track_foreground()
@@ -284,7 +343,7 @@ def build_ui():
                 elif kind == "last":
                     last_var.set(val)
                 elif kind == "btn":
-                    set_button(val)
+                    refresh_buttons()
                 elif kind == "error":
                     status_var.set("出错：" + val)
                     messagebox.showerror("语音输入", val)
@@ -321,7 +380,7 @@ def init_background():
         stream.start()
         log("麦克风已就绪")
 
-        ui("status", "待命 · 按住按钮说话")
+        ui("status", "待命 · 按住或点按说话")
     except Exception as e:
         log("初始化失败：%s\n%s" % (e, traceback.format_exc()))
         ui("error", "初始化失败：%s\n\n详情见 voice_input.log" % e)
